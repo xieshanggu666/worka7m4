@@ -512,14 +512,23 @@ FG.Panels = (() => {
           `<button class="prio-btn prio-${id} ${p.priority === id ? 'active' : ''}" data-plan-prio="${p.id}:${id}">${nm}</button>`).join('')}
       </div>`;
 
-      // 前置依赖
-      const depChips = p.deps.map(id => {
-        const d = cons.byId(id);
-        return d
-          ? `<span class="dep-chip">⛓ ${d.name} <b data-plan-dep-rm="${p.id}:${id}" title="移除前置">×</b></span>`
-          : '';
+      // 阶段前置：每条前置可设「建成放行 / 试产达标放行」，门控状态实时显示
+      const depChips = p.deps.map(d => {
+        const target = cons.byId(d.id) || cons.recordById(d.id);
+        const name = target ? target.name : d.id;
+        const g = cons.gateState(d);
+        const st = depGateText(g);
+        return `<span class="dep-chip${g.satisfied ? ' dep-ok' : ''}" title="${st.tip}">⛓ ${name}
+          <select class="dep-mode" data-dep-mode="${p.id}:${d.id}">
+            <option value="build" ${d.mode !== 'produce' ? 'selected' : ''}>建成放行</option>
+            <option value="produce" ${d.mode === 'produce' ? 'selected' : ''}>试产达标</option>
+          </select>${d.mode === 'produce'
+            ? `<input type="number" class="num-input dep-count" min="1" max="99999" data-dep-count="${p.id}:${d.id}"
+                value="${d.count || FG.Config.TRIAL_PRODUCE_DEFAULT}" title="试产达标所需累计产量（件）">` : ''}
+          <span class="dep-st">${st.txt}</span>
+          <b data-plan-dep-rm="${p.id}:${d.id}" title="移除前置">×</b></span>`;
       }).join('');
-      const canDeps = cons.plans.filter(q => q.id !== p.id && !p.deps.includes(q.id) && !dependsOn(q, p.id));
+      const canDeps = cons.plans.filter(q => q.id !== p.id && !p.deps.some(d => d.id === q.id) && !dependsOn(q, p.id));
       h += `<div class="dep-row">${depChips}`;
       if (canDeps.length) {
         h += `<select class="dep-select" data-plan-dep-add="${p.id}">
@@ -542,9 +551,12 @@ FG.Panels = (() => {
         if (!p.paused && !p.blocked && p.waiting) {
           h += `<div style="font-size:10px;color:var(--text-dim);margin-top:2px">前沿缺料：后续能凑齐建材的建筑会先行建成</div>`;
         }
-        if (p.blocked) {
-          const names = p.deps.map(id => cons.byId(id) ? cons.byId(id).name : null).filter(Boolean).join('、');
-          h += `<div style="font-size:10px;color:var(--text-dim);margin-top:2px">等待前置计划完工：${names}</div>`;
+        if (p.blocked && p.deps.length) {
+          const parts = p.deps.map(d => {
+            const g = cons.gateState(d);
+            return g.name + '（' + depGateText(g).txt + '）';
+          });
+          h += `<div style="font-size:10px;color:var(--text-dim);margin-top:2px">等待前置：${parts.join(' · ')}</div>`;
         }
       }
       h += `<div class="action-row">
@@ -579,6 +591,19 @@ FG.Panels = (() => {
         if (sel.value) FG.game.addPlanDep(sel.dataset.planDepAdd, sel.value);
       };
     }
+    for (const sel of bodyEl().querySelectorAll('[data-dep-mode]')) {
+      sel.onchange = () => {
+        const [pid, did] = sel.dataset.depMode.split(':');
+        FG.game.setPlanDepMode(pid, did, sel.value);
+      };
+    }
+    for (const inp of bodyEl().querySelectorAll('[data-dep-count]')) {
+      inp.onchange = () => {
+        const [pid, did] = inp.dataset.depCount.split(':');
+        const n = parseInt(inp.value, 10);
+        FG.game.setPlanDepMode(pid, did, 'produce', isNaN(n) ? FG.Config.TRIAL_PRODUCE_DEFAULT : n);
+      };
+    }
   }
 
   /** 计划状态徽章 */
@@ -589,10 +614,29 @@ FG.Panels = (() => {
     return { txt: '施工中', cls: 'st-active' };
   }
 
+  /** 阶段前置门控状态 → 芯片文案与悬浮提示 */
+  function depGateText(g) {
+    if (g.satisfied) {
+      if (g.reason === 'produced') return { txt: '✓ 试产达标 ' + g.produced + '/' + g.count, tip: '前置已完工且试产达标，门控放行' };
+      if (g.reason === 'cancelled-ok') return { txt: '✓ 前置已取消', tip: '建成放行的前置被取消，视为满足' };
+      return { txt: '✓ 已建成', tip: '前置已建成，门控放行' };
+    }
+    switch (g.reason) {
+      case 'building': return { txt: '施工中…', tip: '前置计划尚未完工，完工后按门控模式放行' };
+      case 'cancelled': return { txt: '已取消·挂起', tip: '前置已取消，试产条件失效：可移除该前置，或改为「建成放行」' };
+      case 'demolished': return { txt: '被拆×' + g.missing, tip: '前置有建筑被拆除，后继联动挂起并释放预留；原地重建后自动放行' };
+      case 'producing': return {
+        txt: '试产 ' + g.produced + '/' + g.count + (g.starving ? '·缺料' : ''),
+        tip: g.starving ? '前置生产建筑缺料，试产停涨，后继保持挂起' : '前置试产中，累计产量达标后放行',
+      };
+      default: return { txt: '未满足', tip: '前置条件未满足' };
+    }
+  }
+
   /** q 是否（经依赖链传递）依赖 planId —— 用于过滤会成环的前置选项 */
   function dependsOn(q, planId) {
     const cons = FG.game.construction;
-    const stack = q.deps.slice();
+    const stack = q.deps.map(d => d.id);
     const seen = new Set();
     while (stack.length) {
       const id = stack.pop();
@@ -600,7 +644,7 @@ FG.Panels = (() => {
       if (seen.has(id)) continue;
       seen.add(id);
       const d = cons.byId(id);
-      if (d) stack.push(...d.deps);
+      if (d) stack.push(...d.deps.map(x => x.id));
     }
     return false;
   }

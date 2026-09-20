@@ -16,6 +16,19 @@
  *  - 预留按条目记账，计划整体序列化（含优先级/依赖/暂停态/条目预留），读档续建；
  *    旧存档的计划级 stock 迁移到前沿条目，无施工字段的旧档回退空计划。
  *
+ * 分阶段施工（阶段前置门控）：
+ *  - 前置依赖 dep = {id, mode, count}，每个计划即一个生产阶段，蓝图/升级计划均可设置：
+ *      mode='build'   建成放行：前置计划完工（或被取消）即放行——兼容旧行为；
+ *      mode='produce' 试产达标放行：前置计划完工后进入试产观察，其生产建筑（含矿机）
+ *                     累计产出 ≥ count 才放行，缺料时产量停涨、后继保持挂起；
+ *  - 阶段记录 stageRecords：前置计划完工/取消且仍被后继引用时留下观察档案
+ *    （建成建筑坐标、生产建筑坐标、累计试产量与产量基线），随存档序列化；
+ *  - 联动挂起：前置被取消（试产条件失效）、前置缺料（试产停涨）或前置已建成建筑被拆
+ *    时，后继计划自动挂起并释放全部预留；被拆建筑原地重建（含原地升级的高级型号）
+ *    后门控自动重开；门控每 tick 连续评估，状态迁移时写事件日志；
+ *  - 旧存档兼容：deps 为字符串数组的旧档迁移为 build 模式；无 stageRecords 字段回退
+ *    空表，悬空依赖照常剔除。
+ *
  * 原地升级（kind='upgrade'）：
  *  - 升级计划条目带 from（原建筑类型）：备料成本为新建筑造价，落成时把该格旧建筑
  *    原地替换为高级型号 —— 配方、槽位库存、流体、传送带在途物品（含预留标签）、
@@ -144,9 +157,10 @@ FG.Blueprint = (() => {
 FG.Construction = class Construction {
   constructor(game) {
     this.game = game;
-    this.plans = [];   // [{id,name,priority,paused,deps:[id],entries:[{...state,stock}],cursor,timer}]
+    this.plans = [];   // [{id,name,priority,paused,deps:[{id,mode,count}],entries:[{...state,stock}],cursor,timer}]
     this.seq = 1;
     this.tierStart = { high: 0, normal: 0, low: 0 }; // 同级轮转起步游标（每 tick）
+    this.stageRecords = []; // 阶段记录：已完工/取消且仍被后继前置引用的计划观察档案
   }
 
   /** 提交施工计划：蓝图条目落到世界坐标，进入统一调度队列 */
@@ -158,7 +172,7 @@ FG.Construction = class Construction {
       kind: 'build',
       priority: VALID_PRIORITIES[opts.priority] ? opts.priority : 'normal',
       paused: false,
-      deps: [],                 // 前置计划 id：全部完工/取消前本计划挂起
+      deps: [],                 // 阶段前置 [{id,mode,count}]：门控全部放行前本计划挂起
       entries: bp.entries.map(e => ({
         type: e.type, from: null, x: ox + e.dx, y: oy + e.dy, dir: e.dir || 0,
         recipe: e.recipe || null, filter: e.filter || null,
@@ -243,55 +257,122 @@ FG.Construction = class Construction {
   }
 
   /**
-   * 设置前置依赖（覆盖式）：自动剔除不存在/已完工/自身的 id，并做环检测；
+   * 设置前置依赖（覆盖式）：depIds 为计划 id 或 {id,mode,count} 混合数组；
+   * 自动剔除不存在/已完工/自身的 id，并做环检测；
    * 加入依赖会让计划立即挂起并释放预留，解除依赖后自动恢复。
    */
   setDeps(planId, depIds) {
     const p = this.byId(planId);
     if (!p) return false;
-    const ids = [];
-    for (const id of depIds || []) {
-      const d = this.byId(id);
-      if (d && d !== p && !ids.includes(id)) ids.push(id);
+    const deps = [];
+    for (const raw of depIds || []) {
+      const d = normDep(raw);
+      if (!d) continue;
+      const target = this.byId(d.id);
+      if (target && target !== p && !deps.some(x => x.id === d.id)) deps.push(d);
     }
-    p.deps = ids;
+    p.deps = deps;
     if (this.createsCycle(p)) {
       p.deps = [];
       this.game.logMsg('⚠ 无法为「' + p.name + '」设置前置：存在循环依赖', 'error');
       return false;
     }
-    if (ids.length && !this.depsSatisfied(p)) this.releaseReserved(p);
+    if (deps.length && !this.depsSatisfied(p)) this.releaseReserved(p);
     FG.Events.emit('construction:change');
     return true;
   }
 
-  addDep(planId, depId) {
+  addDep(planId, depId, mode, count) {
     const p = this.byId(planId);
     if (!p) return false;
-    if (p.deps.includes(depId)) return true;
-    const next = p.deps.concat([depId]);
+    if (p.deps.some(d => d.id === depId)) return true;
+    const next = p.deps.concat([normDep({ id: depId, mode, count })]);
     return this.setDeps(planId, next);
   }
 
   removeDep(planId, depId) {
     const p = this.byId(planId);
     if (!p) return false;
-    p.deps = p.deps.filter(id => id !== depId);
+    p.deps = p.deps.filter(d => d.id !== depId);
+    FG.Events.emit('construction:change');
+    return true;
+  }
+
+  /**
+   * 设置某条前置的放行模式：'build' 建成放行 / 'produce' 试产达标放行（count 件）。
+   * 切换后门控下一 tick 重新评估；若转为不满足，计划联动挂起并释放预留。
+   */
+  setDepMode(planId, depId, mode, count) {
+    const p = this.byId(planId);
+    if (!p) return false;
+    const d = p.deps.find(x => x.id === depId);
+    if (!d) return false;
+    if (mode === 'build' || mode === 'produce') d.mode = mode;
+    if (count !== undefined && count !== null && !isNaN(count)) {
+      d.count = Math.max(1, Math.min(99999, Math.floor(count)));
+    }
+    if (d.mode === 'produce' && !(d.count > 0)) d.count = FG.Config.TRIAL_PRODUCE_DEFAULT;
+    if (!this.depsSatisfied(p)) this.releaseReserved(p); // 门控关闭 → 立即释放预留
     FG.Events.emit('construction:change');
     return true;
   }
 
   byId(id) { return this.plans.find(p => p.id === id) || null; }
+  recordById(id) { return this.stageRecords.find(r => r.id === id) || null; }
 
-  /** 前置是否全部满足（前置计划已完工出列或被取消 → 视为满足） */
+  /** 前置是否全部满足（逐条评估阶段门控，见 gateState） */
   depsSatisfied(p) {
-    for (const id of p.deps) if (this.byId(id)) return false;
+    for (const d of p.deps) if (!this.gateState(d).satisfied) return false;
     return true;
+  }
+
+  /**
+   * 单条阶段前置的门控状态（每 tick 连续评估，不锁存）：
+   *  前置施工中 → building；前置已取消 → build 视为满足 / produce 条件失效挂起；
+   *  前置已完工 → build 要求建成建筑仍在位（被拆 → demolished 联动挂起）；
+   *              produce 要求生产建筑在位且累计试产 ≥ count（缺料 → starving 提示）。
+   */
+  gateState(dep) {
+    const live = this.byId(dep.id);
+    if (live) return { satisfied: false, reason: 'building', name: live.name };
+    const rec = this.recordById(dep.id);
+    if (!rec) {
+      // 无记录：前置完工/取消时无人引用（或旧档缺字段）→ 视为满足，避免死锁
+      return { satisfied: true, reason: 'gone', name: dep.id };
+    }
+    if (rec.cancelled) {
+      return dep.mode === 'produce'
+        ? { satisfied: false, reason: 'cancelled', name: rec.name }
+        : { satisfied: true, reason: 'cancelled-ok', name: rec.name };
+    }
+    if (dep.mode === 'produce') {
+      const need = dep.count > 0 ? dep.count : FG.Config.TRIAL_PRODUCE_DEFAULT;
+      let missing = 0, starving = false;
+      for (const w of rec.producers) {
+        const b = this.game.map.buildingAt(w.x, w.y);
+        if (!b || !isSameOrUpgrade(w.type, b.type)) missing++;
+        else if (b.status === 'starving') starving = true;
+      }
+      if (missing) return { satisfied: false, reason: 'demolished', missing, name: rec.name };
+      if ((rec.produced || 0) < need) {
+        return { satisfied: false, reason: 'producing', name: rec.name,
+          produced: rec.produced || 0, count: need, starving };
+      }
+      return { satisfied: true, reason: 'produced', name: rec.name, produced: rec.produced, count: need };
+    }
+    // build 模式：前置建成后其建成建筑须仍在位（原地升级的高级型号视为同一建筑）
+    let missing = 0;
+    for (const w of rec.buildings) {
+      const b = this.game.map.buildingAt(w.x, w.y);
+      if (!b || !isSameOrUpgrade(w.type, b.type)) missing++;
+    }
+    if (missing) return { satisfied: false, reason: 'demolished', missing, name: rec.name };
+    return { satisfied: true, reason: 'built', name: rec.name };
   }
 
   /** 从 p 沿 deps 边是否能走回 p（环检测） */
   createsCycle(p) {
-    const stack = p.deps.slice();
+    const stack = p.deps.map(d => d.id);
     const seen = new Set();
     while (stack.length) {
       const id = stack.pop();
@@ -299,9 +380,63 @@ FG.Construction = class Construction {
       if (seen.has(id)) continue;
       seen.add(id);
       const d = this.byId(id);
-      if (d) stack.push(...d.deps);
+      if (d) stack.push(...d.deps.map(x => x.id));
     }
     return false;
+  }
+
+  // ================= 阶段记录（分阶段施工的观察档案） =================
+  /**
+   * 前置计划完工/取消时留下阶段记录（仅当仍被其他计划的前置引用）：
+   * 记录建成建筑坐标（build 门控观察）、生产建筑坐标与产量基线（produce 门控试产累计）。
+   */
+  leaveStageRecord(p, cancelled) {
+    const referenced = this.plans.some(q => q !== p && q.deps.some(d => d.id === p.id));
+    if (!referenced || this.recordById(p.id)) return;
+    const rec = { id: p.id, name: p.name, kind: p.kind || 'build', cancelled: !!cancelled,
+      buildings: [], producers: [], produced: 0, last: {} };
+    if (!cancelled) {
+      for (const e of p.entries) {
+        if (e.state !== 'done') continue;
+        rec.buildings.push({ x: e.x, y: e.y, type: e.type });
+        const def = FG.Buildings.byId(e.type);
+        if (def.recipeBuilding || e.type === 'miner') {
+          rec.producers.push({ x: e.x, y: e.y, type: e.type });
+          const b = this.game.map.buildingAt(e.x, e.y);
+          rec.last[e.x + ',' + e.y] = b ? (b.totalCrafted || 0) : 0;
+        }
+      }
+    }
+    this.stageRecords.push(rec);
+  }
+
+  /** 每 tick 从在位的生产建筑累计试产量（差值法；被拆建筑保留基线，重建后续计） */
+  accumulateTrial() {
+    for (const rec of this.stageRecords) {
+      if (rec.cancelled || !rec.producers.length) continue;
+      for (const w of rec.producers) {
+        const b = this.game.map.buildingAt(w.x, w.y);
+        if (!b || !isSameOrUpgrade(w.type, b.type)) continue;
+        const key = w.x + ',' + w.y;
+        const cur = b.totalCrafted || 0;
+        const prev = rec.last[key];
+        if (prev === undefined) { rec.last[key] = cur; continue; }
+        if (cur > prev) rec.produced += cur - prev;
+        rec.last[key] = cur;
+      }
+    }
+  }
+
+  /** 门控未满足原因 → 日志/面板文案 */
+  gateLogText(g) {
+    if (!g) return '前置条件失效';
+    switch (g.reason) {
+      case 'building': return '前置「' + g.name + '」尚未完工';
+      case 'cancelled': return '前置「' + g.name + '」已取消，试产条件失效';
+      case 'demolished': return '前置「' + g.name + '」有建筑被拆除（' + g.missing + ' 栋）';
+      case 'producing': return '前置「' + g.name + '」试产未达标（' + g.produced + '/' + g.count + '）';
+      default: return '前置条件未满足';
+    }
   }
 
   // ================= 主循环：统一建材池 × 优先级分层 × 同级轮转 =================
@@ -314,13 +449,33 @@ FG.Construction = class Construction {
         this.plans.splice(i, 1);
       }
     }
+    // 阶段记录：累计前置试产量，并清理不再被任何前置引用的档案
+    this.accumulateTrial();
+    if (this.stageRecords.length) {
+      const refs = new Set();
+      for (const p of this.plans) for (const d of p.deps) refs.add(d.id);
+      this.stageRecords = this.stageRecords.filter(r => refs.has(r.id));
+    }
     if (!this.plans.length) return;
 
-    // 状态复位 + 暂停/挂起计划释放预留（不参与本轮分配）
+    // 状态复位 + 暂停/挂起计划释放预留（不参与本轮分配）；
+    // 阶段门控连续评估：前置取消/缺料/建筑被拆 → 门控关闭，后继联动挂起并释放预留
     for (const p of this.plans) {
       p.waiting = false;
       p.blocked = false;
-      if (p.paused || !this.depsSatisfied(p)) {
+      const gates = p.deps.map(d => this.gateState(d));
+      const okAll = gates.every(g => g.satisfied);
+      if (p._gateOk !== undefined && p._gateOk !== okAll && !p.paused) {
+        if (okAll) {
+          this.game.logMsg('✅ 前置条件已满足，「' + p.name + '」解除挂起、开始备料', 'unlock');
+        } else {
+          const g = gates.find(x => !x.satisfied);
+          this.game.logMsg('⚠ ' + this.gateLogText(g) + '，「' + p.name + '」联动挂起并释放预留', 'error');
+        }
+      }
+      p._gateOk = okAll;
+      p._gates = gates;
+      if (p.paused || !okAll) {
         p.blocked = !p.paused; // 暂停优先显示「已暂停」
         this.releaseReserved(p);
       }
@@ -559,9 +714,10 @@ FG.Construction = class Construction {
     }
   }
 
-  /** 计划完工：剩余预留建材返还，移出列表 */
+  /** 计划完工：剩余预留建材返还，留下阶段记录（若被后继前置引用），移出列表 */
   finish(p) {
     this.releaseReserved(p);
+    this.leaveStageRecord(p, false);
     const built = p.entries.filter(e => e.state === 'done').length;
     const skipped = p.entries.filter(e => e.state === 'skip').length;
     this.game.logMsg((p.kind === 'upgrade' ? '⬆ 升级完成「' : '🏗 施工完成「') + p.name + '」：'
@@ -570,12 +726,13 @@ FG.Construction = class Construction {
     FG.Events.emit('construction:change');
   }
 
-  /** 取消计划：已预留建材返还物流，已建成建筑保留；其下游依赖自动解除 */
+  /** 取消计划：已预留建材返还物流，已建成建筑保留；build 前置视为满足，produce 前置联动挂起 */
   cancel(planId) {
     const i = this.plans.findIndex(p => p.id === planId);
     if (i < 0) return false;
     const p = this.plans[i];
     this.releaseReserved(p);
+    this.leaveStageRecord(p, true);   // 试产前置引用了它 → 留下「已取消」档案，后继联动挂起
     const built = p.entries.filter(e => e.state === 'done').length;
     this.plans.splice(i, 1);
     this.game.logMsg('已取消' + (p.kind === 'upgrade' ? '升级计划' : '施工计划') + '「' + p.name + '」：'
@@ -591,7 +748,7 @@ FG.Construction = class Construction {
       plans: this.plans.map(p => ({
         id: p.id, name: p.name, kind: p.kind || 'build',
         priority: p.priority, paused: !!p.paused,
-        deps: (p.deps || []).slice(),
+        deps: (p.deps || []).map(d => ({ id: d.id, mode: d.mode, count: d.count })),
         cursor: p.cursor, timer: p.timer, waiting: p.waiting,
         entries: p.entries.map(e => ({
           type: e.type, from: e.from || null, x: e.x, y: e.y, dir: e.dir, recipe: e.recipe,
@@ -600,12 +757,27 @@ FG.Construction = class Construction {
           stock: Object.assign({}, e.stock),
         })),
       })),
+      // 阶段记录：前置完工/取消后的观察档案（建成建筑、试产累计与产量基线）
+      stageRecords: this.stageRecords.map(r => ({
+        id: r.id, name: r.name, kind: r.kind, cancelled: !!r.cancelled,
+        buildings: r.buildings.map(w => ({ x: w.x, y: w.y, type: w.type })),
+        producers: r.producers.map(w => ({ x: w.x, y: w.y, type: w.type })),
+        produced: r.produced || 0,
+        last: Object.assign({}, r.last),
+      })),
     };
   }
 
   deserialize(data) {
     this.plans = [];
     this.seq = (data && data.seq) || 1;
+    this.stageRecords = ((data && data.stageRecords) || []).map(r => ({
+      id: r.id, name: r.name || r.id, kind: r.kind || 'build', cancelled: !!r.cancelled,
+      buildings: Array.isArray(r.buildings) ? r.buildings.map(w => ({ x: w.x, y: w.y, type: w.type })) : [],
+      producers: Array.isArray(r.producers) ? r.producers.map(w => ({ x: w.x, y: w.y, type: w.type })) : [],
+      produced: r.produced || 0,
+      last: r.last || {},
+    }));
     for (const sp of ((data && data.plans) || [])) {
       const entries = (sp.entries || []).map(e => ({
         type: e.type, from: e.from || null, x: e.x, y: e.y, dir: e.dir || 0,
@@ -621,7 +793,8 @@ FG.Construction = class Construction {
         kind: sp.kind === 'upgrade' ? 'upgrade' : 'build',   // 旧存档无 kind → 普通建造
         priority: VALID_PRIORITIES[sp.priority] ? sp.priority : 'normal',
         paused: !!sp.paused,
-        deps: Array.isArray(sp.deps) ? sp.deps.slice() : [],
+        // 旧存档兼容：deps 为字符串数组 → 迁移为 build 模式门控
+        deps: Array.isArray(sp.deps) ? sp.deps.map(normDep).filter(Boolean) : [],
         cursor: sp.cursor || 0,
         timer: sp.timer || 0,
         waiting: !!sp.waiting,
@@ -633,18 +806,43 @@ FG.Construction = class Construction {
         const head = entries.find(e => e.state === 'wait');
         if (head) head.stock = Object.assign({}, sp.stock);
       }
-      // 依赖指向的计划不在档内（已完工/旧档缺字段）→ 视为已满足，直接剔除
-      plan.deps = plan.deps.filter(id => id !== plan.id);
+      plan.deps = plan.deps.filter(d => d.id !== plan.id);
       this.plans.push(plan);
     }
-    // 二次清理悬空依赖
+    // 二次清理悬空依赖：指向的计划不在档内且无阶段记录（旧档/前置已完工无人引用）→ 视为已满足
     const ids = new Set(this.plans.map(p => p.id));
-    for (const p of this.plans) p.deps = p.deps.filter(id => ids.has(id));
+    for (const r of this.stageRecords) ids.add(r.id);
+    for (const p of this.plans) p.deps = p.deps.filter(d => ids.has(d.id));
   }
 };
 
 const TIERS = ['high', 'normal', 'low'];
 const VALID_PRIORITIES = { high: 1, normal: 1, low: 1 };
+
+/**
+ * 前置依赖归一化：兼容字符串 id（旧存档/旧调用）与 {id,mode,count} 对象。
+ *  mode='build'   建成放行（默认）；mode='produce' 试产达标放行（count 件）。
+ */
+function normDep(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'string') return { id: raw, mode: 'build', count: 0 };
+  if (!raw.id) return null;
+  const mode = raw.mode === 'produce' ? 'produce' : 'build';
+  let count = Math.floor(raw.count) || 0;
+  if (mode === 'produce' && count <= 0) count = FG.Config.TRIAL_PRODUCE_DEFAULT;
+  return { id: raw.id, mode, count };
+}
+
+/** 建筑是否同一产线建筑：同型号，或 watched 经升级链原地升级到的高级型号（不触发联动挂起） */
+function isSameOrUpgrade(watched, actual) {
+  let cur = watched, guard = 0;
+  while (cur && guard++ < 8) {
+    if (cur === actual) return true;
+    const chain = FG.Buildings.UPGRADE_CHAIN[cur];
+    cur = chain && chain.length ? chain[chain.length - 1] : null;
+  }
+  return false;
+}
 
 /**
  * 全局建材预算池：tick 初盘点全图自由建材（箱子→地面堆），

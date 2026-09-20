@@ -378,7 +378,7 @@ console.log('\n[12] 前置依赖：未完工前挂起且不占料，前置完工
   ok(game.submitBlueprintPlan(42, 30), '提交后继计划 B（箱子，2 铁板）');
   const b = game.construction.plans[1];
   ok(game.construction.addDep(b.id, a.id), '设置 B 前置依赖 A');
-  ok(b.deps.includes(a.id) && b.blocked === false, '依赖已登记（状态 tick 后更新）');
+  ok(b.deps.some(d => d.id === a.id) && b.blocked === false, '依赖已登记（状态 tick 后更新）');
   ticks(game, 3);
   ok(!!m.buildingAt(40, 30) && !m.buildingAt(41, 30) && !m.buildingAt(42, 30),
     '前置 A 首条传送带建成，第二条冷却中，后继 B 挂起不开工');
@@ -406,7 +406,7 @@ console.log('\n[12] 前置依赖：未完工前挂起且不占料，前置完工
   const [c, d] = game.construction.plans;
   ok(game.construction.addDep(c.id, d.id), 'C 依赖 D');
   ok(!game.construction.addDep(d.id, c.id), '反向依赖形成环，被拒绝');
-  ok(!d.deps.includes(c.id), '成环依赖未写入');
+  ok(!d.deps.some(x => x.id === c.id), '成环依赖未写入');
   // 取消前置：依赖视为自动满足
   game.construction.cancel(c.id);
   ticks(game, 20);

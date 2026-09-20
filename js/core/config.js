@@ -45,6 +45,7 @@ FG.Config = {
   // 蓝图施工
   BP_MAX_AREA: 400,              // 框选蓝图的最大格数
   CONSTRUCT_BUILD_INTERVAL: 4,   // 施工计划相邻两栋建筑落成的 tick 间隔
+  TRIAL_PRODUCE_DEFAULT: 20,     // 阶段前置「试产达标」的默认累计产量（件）
 
   // 一键流水线
   PIPELINE_SEARCH_RADIUS: 40,    // 智能选位螺旋搜索半径（格）

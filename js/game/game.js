@@ -579,6 +579,8 @@ FG.Game = class Game {
   togglePlanPaused(planId) { return this.construction.togglePaused(planId); }
   addPlanDep(planId, depId) { return this.construction.addDep(planId, depId); }
   removePlanDep(planId, depId) { return this.construction.removeDep(planId, depId); }
+  /** 阶段前置放行模式：'build' 建成放行 / 'produce' 试产达标放行（count 件） */
+  setPlanDepMode(planId, depId, mode, count) { return this.construction.setDepMode(planId, depId, mode, count); }
 
   /** @deprecated 旧名兼容：提交施工计划（新代码请用 submitBlueprintPlanAt） */
   submitBlueprintPlan(ox, oy) { return this.submitBlueprintPlanAt(ox, oy); }

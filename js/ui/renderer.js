@@ -649,7 +649,7 @@ FG.Renderer = (() => {
   }
 
   // ==================== 蓝图施工 ====================
-  /** 施工计划：待建建筑虚线轮廓（当前待建高亮；缺料橙 / 暂停灰 / 等待前置紫 / 施工蓝 / 升级金） */
+  /** 施工计划：待建建筑虚线轮廓（当前待建高亮；缺料橙 / 暂停灰 / 等待前置紫 / 阶段试产青 / 施工蓝 / 升级金） */
   function drawConstruction() {
     const cons = game.construction;
     if (!cons || !cons.plans.length) return;
@@ -658,23 +658,31 @@ FG.Renderer = (() => {
       const isUp = p.kind === 'upgrade';
       const color = p.paused ? 'rgba(139,147,168,0.85)'
         : p.blocked ? 'rgba(176,140,255,0.9)'
+        : p.stageBlocked ? 'rgba(127,199,255,0.95)'
         : p.waiting ? '#e8a33d'
         : isUp ? '#e8be3d'
         : '#4da3ff';
       const colorDim = p.paused ? 'rgba(139,147,168,0.4)'
         : p.blocked ? 'rgba(176,140,255,0.4)'
+        : p.stageBlocked ? 'rgba(127,199,255,0.4)'
         : isUp ? 'rgba(232,190,61,0.45)'
         : 'rgba(77,163,255,0.45)';
-      for (const e of p.entries) {
+      // 活跃阶段之后（闸门未放行）的待建条目：更暗，一眼看出「挂起未备料」
+      const activeTo = p.stages && p.stages.length
+        ? p.stages[Math.min(p.activeStage || 0, p.stages.length - 1)].cut
+        : p.entries.length;
+      for (let i = 0; i < p.entries.length; i++) {
+        const e = p.entries[i];
         if (e.state !== 'wait') continue;
         const px = e.x * t, py = e.y * t;
         const isCur = e === headEntry(p);
-        ctx.globalAlpha = isCur ? 0.5 : 0.28;
+        const beyondGate = i >= activeTo;
+        ctx.globalAlpha = isCur ? 0.5 : (beyondGate ? 0.14 : 0.28);
         ctx.drawImage(buildingIcon(e.type, 32, e.dir), px, py, t, t);
         ctx.globalAlpha = 1;
-        ctx.strokeStyle = isCur ? color : colorDim;
+        ctx.strokeStyle = isCur ? color : (beyondGate ? 'rgba(127,199,255,0.35)' : colorDim);
         ctx.lineWidth = isCur ? 2 : 1;
-        ctx.setLineDash(p.paused ? [2, 3] : [4, 3]);
+        ctx.setLineDash(p.paused ? [2, 3] : (beyondGate ? [1, 3] : [4, 3]));
         ctx.strokeRect(px + 1.5, py + 1.5, t - 3, t - 3);
         ctx.setLineDash([]);
       }

@@ -5,7 +5,7 @@
 window.FG = window.FG || {};
 
 FG.Config = {
-  VERSION: '1.6.0',
+  VERSION: '1.7.0',
 
   // 仿真节拍：每秒 20 tick
   TPS: 20,
@@ -45,6 +45,7 @@ FG.Config = {
   // 蓝图施工
   BP_MAX_AREA: 400,              // 框选蓝图的最大格数
   CONSTRUCT_BUILD_INTERVAL: 4,   // 施工计划相邻两栋建筑落成的 tick 间隔
+  STAGE_TRIAL_COUNT: 3,          // 阶段「试产达标」默认需要的完成生产次数
 
   // 一键流水线
   PIPELINE_SEARCH_RADIUS: 40,    // 智能选位螺旋搜索半径（格）

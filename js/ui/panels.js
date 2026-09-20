@@ -506,6 +506,9 @@ FG.Panels = (() => {
         <div class="progress-bar"><div class="fill" style="width:${(done / total * 100).toFixed(1)}%"></div></div>
         <div style="font-size:11px;color:var(--text-dim)">进度 ${done}/${total} 栋${skipped ? ' · 跳过 ' + skipped : ''}</div>`;
 
+      // —— 分阶段施工：阶段列表 + 闸门设置 + 新增切分 ——
+      h += renderStages(cons, p);
+
       // 计划优先级：高/中/低 —— 统一建材池分层拨付，高层未取料前低层等待
       h += `<div class="prio-row plan-prio">
         ${[['high', '高'], ['normal', '中'], ['low', '低']].map(([id, nm]) =>
@@ -546,6 +549,9 @@ FG.Panels = (() => {
           const names = p.deps.map(id => cons.byId(id) ? cons.byId(id).name : null).filter(Boolean).join('、');
           h += `<div style="font-size:10px;color:var(--text-dim);margin-top:2px">等待前置计划完工：${names}</div>`;
         }
+        if (!p.paused && !p.blocked && p.stageBlocked) {
+          h += `<div style="font-size:10px;color:#7fc7ff;margin-top:2px">⏳ ${p.stageReason || '等待前置阶段放行'}</div>`;
+        }
       }
       h += `<div class="action-row">
         <button data-plan-pause="${p.id}">${p.paused ? '▶ 继续' : '⏸ 暂停'}</button>
@@ -579,14 +585,156 @@ FG.Panels = (() => {
         if (sel.value) FG.game.addPlanDep(sel.dataset.planDepAdd, sel.value);
       };
     }
+
+    // —— 分阶段施工事件 ——
+    // 在某条目前切分新阶段
+    for (const sel of bodyEl().querySelectorAll('[data-stage-split]')) {
+      sel.onchange = () => {
+        const cut = parseInt(sel.value, 10);
+        if (cut > 0) FG.game.splitPlanStage(sel.dataset.stageSplit, cut);
+      };
+    }
+    // 删除阶段边界
+    for (const el of bodyEl().querySelectorAll('[data-stage-rm]')) {
+      el.onclick = () => {
+        const [id, idx] = el.dataset.stageRm.split(':');
+        FG.game.removePlanStage(id, parseInt(idx, 10));
+      };
+    }
+    // 闸门模式：none=移除闸门 built=建成放行 trial=试产达标
+    for (const sel of bodyEl().querySelectorAll('[data-stage-gate-mode]')) {
+      sel.onchange = () => {
+        const [id, idx] = sel.dataset.stageGateMode.split(':');
+        const k = parseInt(idx, 10);
+        const cons = FG.game.construction;
+        const p = cons.byId(id);
+        if (!p) return;
+        const prev = p.stages[k] && p.stages[k].gate;
+        if (sel.value === 'none') FG.game.setPlanStageGate(id, k, null);
+        else if (sel.value === 'built') FG.game.setPlanStageGate(id, k, { mode: 'built' });
+        else FG.game.setPlanStageGate(id, k, {
+          mode: 'trial',
+          item: prev && prev.item ? prev.item : null,
+          n: prev && prev.n ? prev.n : FG.Config.STAGE_TRIAL_COUNT,
+        });
+      };
+    }
+    // 试产产物（空=任意产物）
+    for (const sel of bodyEl().querySelectorAll('[data-stage-gate-item]')) {
+      sel.onchange = () => {
+        const [id, idx] = sel.dataset.stageGateItem.split(':');
+        const k = parseInt(idx, 10);
+        const p = FG.game.construction.byId(id);
+        if (!p || !p.stages[k].gate || p.stages[k].gate.mode !== 'trial') return;
+        FG.game.setPlanStageGate(id, k, {
+          mode: 'trial', item: sel.value || null, n: p.stages[k].gate.n || FG.Config.STAGE_TRIAL_COUNT,
+        });
+      };
+    }
+    // 试产次数
+    for (const inp of bodyEl().querySelectorAll('[data-stage-gate-n]')) {
+      inp.onchange = () => {
+        const [id, idx] = inp.dataset.stageGateN.split(':');
+        const k = parseInt(idx, 10);
+        const p = FG.game.construction.byId(id);
+        if (!p || !p.stages[k].gate || p.stages[k].gate.mode !== 'trial') return;
+        const n = Math.max(1, Math.min(999, parseInt(inp.value, 10) || FG.Config.STAGE_TRIAL_COUNT));
+        FG.game.setPlanStageGate(id, k, { mode: 'trial', item: p.stages[k].gate.item || null, n });
+      };
+    }
   }
 
   /** 计划状态徽章 */
   function planStatus(p) {
     if (p.paused) return { txt: '已暂停', cls: 'st-paused' };
     if (p.blocked) return { txt: '等待前置', cls: 'st-blocked' };
+    if (p.stageBlocked) return { txt: '阶段试产', cls: 'st-stage' };
     if (p.waiting) return { txt: '缺料等待', cls: 'st-waiting' };
     return { txt: '施工中', cls: 'st-active' };
+  }
+
+  /**
+   * 分阶段施工区块：
+   *  - 逐阶段显示进度/闸门状态（建成放行/试产达标 + 可选产物 + 次数）；
+   *  - 闸门可在「无 / 建成 / 试产」间切换，试产产物取阶段建筑当前产物；
+   *  - 可在当前待建条目之前切分新阶段、删除已建阶段边界。
+   */
+  function renderStages(cons, p) {
+    const nStages = p.stages.length;
+    let html = `<div class="stage-box">`;
+    html += `<div class="stage-title">🧱 分阶段施工（${nStages} 阶段）</div>`;
+    for (let k = 0; k < nStages; k++) {
+      const { from, to } = cons.stageRange(p, k);
+      const stageEntries = p.entries.slice(from, to);
+      const sDone = stageEntries.filter(e => e.state === 'done').length;
+      const sSkip = stageEntries.filter(e => e.state === 'skip').length;
+      const isActive = (p.activeStage || 0) === k;
+      const gate = k < nStages - 1 ? p.stages[k].gate : null;
+      const isLast = k === nStages - 1;
+
+      let stateCls = 'stg-done';
+      let stateTxt = '✓ 已放行';
+      if (isActive && p.stageBlocked) { stateCls = 'stg-trial'; stateTxt = '⏳ 试产中'; }
+      else if (isActive) { stateCls = 'stg-active'; stateTxt = '▶ 施工中'; }
+      else if (!gate || gate.opened) { stateCls = 'stg-done'; stateTxt = isLast ? '末阶段' : '✓ 已放行'; }
+      else { stateCls = 'stg-pending'; stateTxt = '待开工'; }
+
+      html += `<div class="stage-row ${isActive ? 'is-active' : ''}">
+        <div class="stage-head">
+          <span class="stage-name">阶段 ${k + 1}</span>
+          <span class="stage-state ${stateCls}">${stateTxt}</span>
+          <span class="stage-cnt">${sDone}/${stageEntries.length} 栋${sSkip ? '（跳 ' + sSkip + '）' : ''}</span>
+        </div>`;
+
+      // 闸门编辑（末尾阶段无闸门）
+      if (!isLast) {
+        const mode = gate ? gate.mode : 'none';
+        const trialItems = cons.stageTrialItems(p, k);
+        html += `<div class="gate-row">
+          <span class="gate-label">放行：</span>
+          <select data-stage-gate-mode="${p.id}:${k}">
+            <option value="none" ${mode === 'none' ? 'selected' : ''}>无（建成即放行）</option>
+            <option value="built" ${mode === 'built' ? 'selected' : ''}>建成放行</option>
+            <option value="trial" ${mode === 'trial' ? 'selected' : ''}>试产达标…</option>
+          </select>`;
+        if (mode === 'trial') {
+          const need = gate.n || FG.Config.STAGE_TRIAL_COUNT;
+          html += `<select data-stage-gate-item="${p.id}:${k}" title="试产产物（空=任意产物）">
+            <option value="" ${!gate.item ? 'selected' : ''}>任意产物</option>
+            ${trialItems.map(it => `<option value="${it}" ${gate.item === it ? 'selected' : ''}>${FG.Items.byId(it).name}</option>`).join('')}
+          </select>
+          <input type="number" min="1" max="999" class="gate-n" value="${need}" data-stage-gate-n="${p.id}:${k}" title="需要完成的生产次数">
+          <span class="gate-prog">${cons.trialProgress(p, k)}/${need}</span>`;
+        }
+        html += `</div>`;
+        // 已开放闸门再收紧（无/试产）会重新挂起后续阶段
+        if (gate && gate.opened) {
+          html += `<div class="gate-hint">已放行：收紧闸门将重新挂起后续施工</div>`;
+        }
+        // 删除该阶段边界（与下一阶段合并，闸门一并移除 = 取消前置）
+        html += `<b class="stage-rm" data-stage-rm="${p.id}:${k}" title="删除此阶段边界（并入下一阶段、取消该闸门）">×</b>`;
+      }
+      html += `</div>`;
+    }
+
+    // 在「下一个待建条目」前切分新阶段（光标位置只能在待建区域，已建部分不可再切）
+    const firstWait = p.entries.findIndex(e => e.state === 'wait');
+    html += `<div class="stage-add">
+      <select data-stage-split="${p.id}">
+        <option value="">＋ 在条目前切分新阶段…</option>`;
+    if (firstWait >= 0) {
+      for (let i = Math.max(1, firstWait); i < p.entries.length; i++) {
+        if (p.stages.some(s => s.cut === i)) continue;
+        const e = p.entries[i];
+        const nm = e.from
+          ? FG.Buildings.byId(e.from).name + '→' + FG.Buildings.byId(e.type).name
+          : FG.Buildings.byId(e.type).name;
+        html += `<option value="${i}">#${i + 1} ${nm}（${e.x},${e.y}）前</option>`;
+      }
+    }
+    html += `</select></div>`;
+    html += `</div>`;
+    return html;
   }
 
   /** q 是否（经依赖链传递）依赖 planId —— 用于过滤会成环的前置选项 */

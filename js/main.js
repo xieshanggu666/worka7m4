@@ -299,10 +299,16 @@
       const p = planEntry.plan, e = planEntry.entry;
       const def = FG.Buildings.byId(e.type);
       const cost = FG.Buildings.costOf(e.type);
+      const eIdx = p.entries.indexOf(e);
+      const sIdx = game.construction.stageOfEntry(p, eIdx);
+      const activeTo = p.stages && p.stages.length
+        ? p.stages[Math.min(p.activeStage || 0, p.stages.length - 1)].cut : p.entries.length;
       html += `<div class="tt-title">🏗 ${p.name}</div>`;
-      html += `<div class="tt-row">待建：<b>${def.name}</b>（${FG.Utils.dirName(e.dir)}）</div>`;
+      html += `<div class="tt-row">待建：<b>${def.name}</b>（${FG.Utils.dirName(e.dir)}） · 阶段 ${sIdx + 1}/${p.stages.length}</div>`;
       const stTxt = p.paused ? '已暂停（预留已返还）'
         : p.blocked ? '等待前置计划'
+        : p.stageBlocked ? (p.stageReason || '等待前置阶段放行')
+        : (eIdx >= activeTo) ? '等待前置阶段放行（不占料）'
         : p.waiting ? '缺料等待（可建部分先行）'
         : '施工中';
       html += `<div class="tt-row">状态：<b>${stTxt}</b></div>`;

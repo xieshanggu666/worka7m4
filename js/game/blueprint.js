@@ -1,6 +1,6 @@
 /**
  * FG.Blueprint —— 蓝图：框选捕获、旋转、成本汇总、科技/地形校验
- * FG.Construction —— 施工调度：计划优先级 × 前置依赖 × 全局建材统一分配
+ * FG.Construction —— 施工调度：分阶段闸门 × 计划优先级 × 前置依赖 × 全局建材统一分配
  *
  * 调度模型（每 tick 一轮）：
  *  - 先盘点全图「自由建材」（箱子→地面物料堆）构成统一预算池，所有计划共享；
@@ -15,6 +15,21 @@
  *    已建成建筑保留；前置计划被取消视为依赖自动满足；
  *  - 预留按条目记账，计划整体序列化（含优先级/依赖/暂停态/条目预留），读档续建；
  *    旧存档的计划级 stock 迁移到前沿条目，无施工字段的旧档回退空计划。
+ *
+ * 分阶段产线（stages × gates）：
+ *  - 计划条目按切分点（stage.cut：阶段末条目的下一个下标）划分为若干顺序阶段；
+ *  - 非末尾阶段各带一个放行闸门 gate：
+ *      { mode:'built' }            阶段全部建成（含跳过）即放行后续阶段；
+ *      { mode:'trial', item?, n }  阶段建成后还须「试产达标」：阶段内生产建筑
+ *                                  （组装机/熔炉/化工厂/炼油厂/矿机）累计完成 n 次
+ *                                  生产（可选 item 限定产物；item 为空=任意产物）；
+ *  - 只有「活跃阶段」可备料施工；闸门未开放的后续阶段不占料，每 tick 释放其预留；
+ *  - 闸门开放后其建成建筑若被拆/被换成非目标型号 → 条目回退待建（升级条目按新造
+ *    重建设价备料）、闸门自动关闭、后续阶段挂起并释放预留；重建并再次达标后自动
+ *    重新放行（阶段进度随存档保存）；
+ *  - 缺料联动：活跃阶段缺料时同样挂起后续阶段（其预留本就不入账，统一在每 tick 释放）；
+ *  - 试产基线：阶段进入试产等待时快照其内生产建筑的 totalCrafted（条目 base，null=未建立），
+ *    试产增量按阶段内条目求和；阶段进度（切分/闸门/open/base）随存档保存。
  *
  * 原地升级（kind='upgrade'）：
  *  - 升级计划条目带 from（原建筑类型）：备料成本为新建筑造价，落成时把该格旧建筑
@@ -159,6 +174,7 @@ FG.Construction = class Construction {
       priority: VALID_PRIORITIES[opts.priority] ? opts.priority : 'normal',
       paused: false,
       deps: [],                 // 前置计划 id：全部完工/取消前本计划挂起
+      stages: [{ cut: bp.entries.length, gate: null }],  // 分阶段：默认单阶段
       entries: bp.entries.map(e => ({
         type: e.type, from: null, x: ox + e.dx, y: oy + e.dy, dir: e.dir || 0,
         recipe: e.recipe || null, filter: e.filter || null,
@@ -166,11 +182,15 @@ FG.Construction = class Construction {
         stationName: e.stationName || null,
         state: 'wait',           // wait | done | skip
         stock: {},               // 该条目已预留（移出物流）的建材
+        base: null,              // 阶段试产基线：null=未建立（进入试产等待时快照）
       })),
       cursor: 0,
       timer: 0,
       waiting: false,            // 缺料等待（UI 状态）
       blocked: false,            // 等待前置依赖（UI 状态）
+      stageBlocked: false,       // 等待前置阶段闸门（建成/试产）放行（UI 状态）
+      stageReason: '',           // 闸门等待原因（UI 文案）
+      activeStage: 0,            // 当前可施工阶段下标（每 tick reconcile 刷新）
     };
     this.plans.push(plan);
     FG.Events.emit('construction:change');
@@ -190,6 +210,7 @@ FG.Construction = class Construction {
       priority: VALID_PRIORITIES[opts.priority] ? opts.priority : 'normal',
       paused: false,
       deps: [],
+      stages: [{ cut: list.length, gate: null }],
       entries: list.map(u => ({
         type: u.to, from: u.from, x: u.x, y: u.y, dir: u.dir || 0,
         recipe: null, filter: null,            // 配方/筛选等落成时从旧建筑实时迁移
@@ -197,11 +218,15 @@ FG.Construction = class Construction {
         stationName: null,
         state: 'wait',
         stock: {},
+        base: null,
       })),
       cursor: 0,
       timer: 0,
       waiting: false,
       blocked: false,
+      stageBlocked: false,
+      stageReason: '',
+      activeStage: 0,
     };
     this.plans.push(plan);
     FG.Events.emit('construction:change');
@@ -283,6 +308,150 @@ FG.Construction = class Construction {
 
   byId(id) { return this.plans.find(p => p.id === id) || null; }
 
+  // ================= 分阶段：切分 / 闸门设置 =================
+  /** 规整阶段切分点：严格递增、全部落在 (0, entries.length) 区间；闸门按 cut 对齐保留 */
+  normalizeStages(p) {
+    const n = p.entries.length;
+    const gateByCut = new Map();
+    for (const s of (p.stages || [])) {
+      const cut = s.cut | 0;
+      if (cut > 0 && cut < n && s.gate && !gateByCut.has(cut)) gateByCut.set(cut, sanitizeGate(s.gate));
+    }
+    const cuts = Array.from(gateByCut.keys());
+    // 兼容：即使旧切分点无闸门也要保留（从旧 stages 收集全部 cut）
+    for (const s of (p.stages || [])) {
+      const cut = s.cut | 0;
+      if (cut > 0 && cut < n && !cuts.includes(cut)) cuts.push(cut);
+    }
+    cuts.sort((a, b) => a - b);
+    const stages = cuts.map(cut => ({ cut, gate: gateByCut.get(cut) || null }));
+    stages.push({ cut: n, gate: null });   // 末尾阶段不放行闸门
+    p.stages = stages;
+    if (p.activeStage === undefined || p.activeStage > stages.length - 1) p.activeStage = 0;
+  }
+
+  /**
+   * 在条目下标 cut 处切分阶段（cut = 新阶段第一个条目的下标）。
+   * 已存在的切分点幂等返回 true。返回是否实际发生变更。
+   */
+  splitStage(planId, cut) {
+    const p = this.byId(planId);
+    if (!p) return false;
+    cut = cut | 0;
+    if (cut <= 0 || cut >= p.entries.length) return false;
+    if (p.stages.some(s => s.cut === cut)) return true;
+    p.stages.push({ cut, gate: { mode: 'built' } });
+    this.normalizeStages(p);
+    this.reconcileStages(p);   // 立即按新阶段挂起并释放后续预留
+    FG.Events.emit('construction:change');
+    return true;
+  }
+
+  /** 删除第 idx 个阶段边界（其条目并入下一阶段，闸门随之删除） */
+  removeStage(planId, idx) {
+    const p = this.byId(planId);
+    if (!p || idx < 0 || idx >= p.stages.length - 1) return false;  // 末尾阶段不可删
+    p.stages.splice(idx, 1);
+    this.normalizeStages(p);
+    this.reconcileStages(p);   // 闸门移除 → 后续可能立即放行
+    FG.Events.emit('construction:change');
+    return true;
+  }
+
+  /**
+   * 设置阶段闸门：
+   *   mode='built' 建成即放行；mode='trial' 试产达标（gate.item 可空，gate.n 次数）；
+   *   gate=null 移除闸门（等同于建成放行）。
+   */
+  setStageGate(planId, idx, gate) {
+    const p = this.byId(planId);
+    if (!p || idx < 0 || idx >= p.stages.length - 1) return false;
+    const prev = p.stages[idx].gate;
+    if (gate === null) {
+      p.stages[idx].gate = null;   // 移除闸门 → reconcile 视为放行
+    } else {
+      const g = sanitizeGate(gate);
+      if (!g) return false;
+      // 从「建成/无」切到「试产」：重新开始试产——关闭闸门并重置该阶段基线，
+      // 历史产量不计入；仅调整试产产物/次数（同为 trial）则保留进行中的试产进度。
+      if (g.mode === 'trial' && (!prev || prev.mode !== 'trial')) {
+        g.opened = false;
+        for (const i of this.stageEntryIdxs(p, idx)) p.entries[i].base = null;
+      }
+      // 从「试产」放宽为「建成」：关闭状态交由 reconcile 按建成即开放处理
+      if (g.mode === 'built' && prev && prev.mode === 'trial') g.opened = false;
+      p.stages[idx].gate = g;
+    }
+    this.reconcileStages(p);
+    FG.Events.emit('construction:change');
+    return true;
+  }
+
+  /** 阶段下标区间 {from,to}（entry 下标 [from,to)） */
+  stageRange(p, idx) {
+    const from = idx === 0 ? 0 : p.stages[idx - 1].cut;
+    return { from, to: p.stages[idx].cut };
+  }
+
+  /** 条目所属阶段下标 */
+  stageOfEntry(p, entryIdx) {
+    for (let i = 0; i < p.stages.length; i++) if (entryIdx < p.stages[i].cut) return i;
+    return p.stages.length - 1;
+  }
+
+  /** 阶段内条目下标列表 */
+  stageEntryIdxs(p, idx) {
+    const { from, to } = this.stageRange(p, idx);
+    const out = [];
+    for (let i = from; i < to; i++) out.push(i);
+    return out;
+  }
+
+  /**
+   * 试产进度：阶段内生产建筑（配方建筑/矿机）相对基线 base 的完成次数增量；
+   * gate.item 限定产物，缺省（null/''）= 任意产物。非试产闸门/基线未建立返回 0。
+   * 只读：基线由 ensureTrialBaseline 在阶段建成进入等待时建立，UI 轮询不产生副作用。
+   */
+  trialProgress(p, idx) {
+    const g = p.stages[idx] && p.stages[idx].gate;
+    if (!g || g.mode !== 'trial') return 0;
+    let sum = 0;
+    for (const i of this.stageEntryIdxs(p, idx)) {
+      const e = p.entries[i];
+      if (typeof e.base !== 'number') continue;   // 基线未建立（阶段尚未建成进入等待）
+      const b = this.game.map.buildingAt(e.x, e.y);
+      if (!b || !isProducer(e, b)) continue;
+      const delta = (b.totalCrafted || 0) - e.base;
+      if (delta <= 0) continue;
+      if (g.item) {
+        const items = producerItems(this.game, e, b);
+        if (items.includes(g.item)) sum += delta;
+      } else {
+        sum += delta;
+      }
+    }
+    return sum;
+  }
+
+  /**
+   * 阶段可供选择的试产产物：优先取已落成建筑的当前产物；阶段尚未建成时
+   * 从蓝图条目预设配方（矿机取 require.oreType）推断，便于提交前就指定试产产物。
+   */
+  stageTrialItems(p, idx) {
+    const out = [];
+    const push = (it) => { if (it && !out.includes(it)) out.push(it); };
+    for (const i of this.stageEntryIdxs(p, idx)) {
+      const e = p.entries[i];
+      const b = this.game.map.buildingAt(e.x, e.y);
+      if (b && isProducer(e, b)) {
+        for (const it of producerItems(this.game, e, b)) push(it);
+      } else {
+        for (const it of plannedItems(e)) push(it);
+      }
+    }
+    return out;
+  }
+
   /** 前置是否全部满足（前置计划已完工出列或被取消 → 视为满足） */
   depsSatisfied(p) {
     for (const id of p.deps) if (this.byId(id)) return false;
@@ -306,7 +475,13 @@ FG.Construction = class Construction {
 
   // ================= 主循环：统一建材池 × 优先级分层 × 同级轮转 =================
   tick() {
-    // 先清理已无待建条目的计划（返还残余预留），避免 depsSatisfied 误判
+    // 先对所有计划做阶段对账（不分配建材，仅状态/预留/闸门）：上一 tick 落成的建筑在
+    // tick 间隙被拆/降型时，这里把 done 回退 wait、关闭闸门、挂起后续阶段并释放预留——
+    // 必须早于完工清理，否则「条目恰好全 done 但闸门建筑刚被拆」的计划会被误判完工出列。
+    // 暂停/等前置的计划同样对账：等待期间建筑也可能被拆，状态须保持准确。
+    for (const p of this.plans) this.reconcileStages(p);
+
+    // 再清理已无待建条目的计划（返还残余预留），避免 depsSatisfied 误判
     for (let i = this.plans.length - 1; i >= 0; i--) {
       const p = this.plans[i];
       if (!p.entries.some(e => e.state === 'wait')) {
@@ -320,6 +495,8 @@ FG.Construction = class Construction {
     for (const p of this.plans) {
       p.waiting = false;
       p.blocked = false;
+      // 暂停计划本轮不对账（见下），保留其阶段等待态仅用于 UI；可调度计划由对账刷新
+      if (!p.paused && this.depsSatisfied(p)) { p.stageBlocked = false; p.stageReason = ''; }
       if (p.paused || !this.depsSatisfied(p)) {
         p.blocked = !p.paused; // 暂停优先显示「已暂停」
         this.releaseReserved(p);
@@ -338,10 +515,130 @@ FG.Construction = class Construction {
       let progressed = false;
       for (let n = 0; n < list.length; n++) {
         const p = list[(start + n) % list.length];
+        // 分阶段对账：被拆条目回退、闸门开关、后续阶段预留释放、cursor 收敛
+        this.reconcileStages(p);
         if (this.processPlan(p, pool)) progressed = true;
       }
       // 本轮有计划推进（预留/落成），下轮从它后面开始：同级公平
       if (progressed) this.tierStart[tier] = (start + 1) % list.length;
+    }
+  }
+
+  /**
+   * 分阶段对账（每 tick、每个可调度计划一次）：
+   *  1. 已落成条目若该格建筑被拆/被换成非目标型号 → 回退 wait（升级条目按新造重备料），
+   *     已关闭闸门因此可以重新开放（重建达标后自动放行）；
+   *  2. 顺序扫描阶段：首个未完全建成/未通过闸门的阶段为「活跃阶段」；其后阶段的
+   *     wait 条目预留全部释放（缺料/挂起联动，不占料），cursor 收敛到活跃阶段；
+   *  3. 已开放闸门若再次失效（建筑被拆）→ 经步骤 1 回退条目后闸门自动关闭、
+   *     回退活跃阶段、挂起后续施工。
+   * 进入试产等待时建立试产基线（base，详见 ensureTrialBaseline）。
+   */
+  reconcileStages(p) {
+    this.normalizeStages(p);
+    const n = p.entries.length;
+
+    // —— 1. 已完成条目建筑复验：被拆/换成非目标型号 → 回退待建（联动挂起后续阶段） ——
+    let revertedStage = -1;   // 发生回退的最前阶段下标（该阶段及其后闸门都要重关）
+    for (let i = 0; i < n; i++) {
+      const e = p.entries[i];
+      if (e.state !== 'done') continue;
+      const cur = this.game.map.buildingAt(e.x, e.y);
+      const stillBuilt = !!(cur && cur.type === e.type);   // 建造/升级条目：同型建筑仍在
+      if (!stillBuilt) {
+        e.state = 'wait';
+        e.stock = {};
+        e.base = null;   // 旧基线作废，重建进入试产等待时重新快照
+        const sIdx = this.stageOfEntry(p, i);
+        if (revertedStage < 0 || sIdx < revertedStage) revertedStage = sIdx;
+        this.game.logMsg('↩ 「' + p.name + '」的前置建筑 (' + e.x + ',' + e.y + ') '
+          + FG.Buildings.byId(e.type).name + ' 已被拆除/变更：回退该条目并挂起后续阶段施工', 'error');
+      }
+    }
+    // 回退条目所在阶段及其后所有已开放闸门重新关闭——它们的放行前提（前置建成/试产）
+    // 已被破坏，须重建并再次达标后才重新放行
+    if (revertedStage >= 0) {
+      for (let k = revertedStage; k < p.stages.length - 1; k++) {
+        if (p.stages[k].gate) p.stages[k].gate.opened = false;
+      }
+    }
+
+    // —— 2. 顺序找活跃阶段（首个未建成或闸门未通过的阶段） ——
+    let active = p.stages.length - 1;
+    let gateWaiting = null;
+    let gateJustOpened = false;
+    for (let k = 0; k < p.stages.length; k++) {
+      const { from, to } = this.stageRange(p, k);
+      let complete = true;
+      for (let i = from; i < to; i++) if (p.entries[i].state === 'wait') { complete = false; break; }
+      if (!complete) { active = k; break; }
+      // 阶段已建成：校验放行闸门（末尾阶段无闸门）
+      const gate = k < p.stages.length - 1 ? p.stages[k].gate : null;
+      if (!gate) continue;
+      gate.opened = !!gate.opened;
+      if (gate.opened) continue;
+      if (gate.mode === 'built') {
+        gate.opened = true;   // 全部建成（含跳过）即放行
+        gateJustOpened = true;
+        this.game.logMsg('✅「' + p.name + '」阶段 ' + (k + 1) + ' 已建成，放行后续阶段施工', 'unlock');
+      } else {
+        this.ensureTrialBaseline(p, k);   // 进入试产等待时建立基线（先建成后改闸门也正确）
+        if (this.trialProgress(p, k) >= trialNeed(gate)) {
+          gate.opened = true;
+          gateJustOpened = true;
+          this.game.logMsg('✅「' + p.name + '」阶段 ' + (k + 1) + ' 试产达标，放行后续阶段施工', 'unlock');
+        } else {
+          active = k;
+          gateWaiting = k;
+          break;
+        }
+      }
+    }
+
+    // —— 3. 活跃阶段之后：全部 wait 条目不参与施工，释放其预留（每 tick 幂等） ——
+    const activeTo = p.stages[active].cut;
+    for (let i = activeTo; i < n; i++) {
+      const e = p.entries[i];
+      if (e.state === 'wait') this.releaseEntryStock(e);
+    }
+
+    // cursor 收敛到活跃阶段首个 wait（兼容被拆回退把 cursor 推前的情况）
+    const activeFrom = active === 0 ? 0 : p.stages[active - 1].cut;
+    let cursor = n;
+    for (let i = activeFrom; i < activeTo; i++) {
+      if (p.entries[i].state === 'wait') { cursor = i; break; }
+    }
+    p.cursor = cursor;
+    // 闸门本轮刚放行进入新阶段 → 清掉上一阶段遗留的施工冷却，新阶段第一栋可立即备料；
+    // 同阶段内/被拆回退保留冷却（相邻建筑落成节奏）
+    if (gateJustOpened) p.timer = 0;
+    p.activeStage = active;
+    p.stageBlocked = gateWaiting !== null;
+    if (gateWaiting !== null) {
+      const g = p.stages[gateWaiting].gate;
+      if (g.mode === 'trial') {
+        const itemName = g.item ? FG.Items.byId(g.item).name : '任意产物';
+        p.stageReason = '阶段 ' + (gateWaiting + 1) + ' 试产中：' + itemName + ' '
+          + this.trialProgress(p, gateWaiting) + '/' + trialNeed(g);
+      } else {
+        p.stageReason = '阶段 ' + (gateWaiting + 1) + ' 建成放行';
+      }
+    }
+  }
+
+  /**
+   * 建立试产基线：阶段内生产建筑的 totalCrafted 快照（base 未初始化时一次性写入）。
+   * 在「阶段建成、进入试产等待」时调用——因此先建成后才把闸门改成试产，
+   * 基线也取设置闸门当下的产量，历史产量不会被算入试产增量。
+   * 闸门重开（建筑被拆重建后再次进入等待）会把回退条目的 base 清零，重新建基线。
+   */
+  ensureTrialBaseline(p, idx) {
+    for (const i of this.stageEntryIdxs(p, idx)) {
+      const e = p.entries[i];
+      const b = this.game.map.buildingAt(e.x, e.y);
+      if (b && isProducer(e, b) && (e.base === undefined || e.base === null)) {
+        e.base = b.totalCrafted || 0;
+      }
     }
   }
 
@@ -360,20 +657,28 @@ FG.Construction = class Construction {
   }
 
   /**
-   * 推进单个计划一轮：
+   * 推进单个计划一轮（仅限「活跃阶段」区间 [aFrom, aTo)）：
    *  1. 跳过已建成/被占位的条目，推进 cursor；
    *  2. 前沿条目尽量预留缺口建材（可部分预留），凑齐且间隔到期则建成；
-   *  3. 前沿缺料时，向后找一栋「整套成本本轮能一次凑齐」的条目先建（推进可施工部分）。
+   *  3. 前沿缺料时，仅在活跃阶段内向后找一栋「整套成本本轮能一次凑齐」的条目先建。
    * 返回本轮是否有推进（预留到新料或落成建筑）。
    */
   processPlan(p, pool) {
     let progressed = false;
 
+    // 活跃阶段区间（reconcileStages 已计算 activeStage / cursor，双保险）
+    const aIdx = p.activeStage || 0;
+    const aFrom = aIdx === 0 ? 0 : p.stages[aIdx - 1].cut;
+    const aTo = p.stages[aIdx].cut;
+
+    // 试产等待：活跃阶段已无待建条目（闸门未开），不分配建材
+    if (p.stageBlocked || p.cursor >= aTo || p.cursor < aFrom) return progressed;
+
     // 落成节奏：相邻建筑间隔 CONSTRUCT_BUILD_INTERVAL tick（冷却中只推进游标，不占料）
     if (p.timer > 0) p.timer--;
 
     // 推进 cursor 到下一待建条目；顺带复验已不可放置的条目（提交后被占 → 跳过）
-    while (p.cursor < p.entries.length) {
+    while (p.cursor < aTo) {
       const e = p.entries[p.cursor];
       if (e.state !== 'wait') { p.cursor++; continue; }
       const chk = this.checkEntry(e);
@@ -396,7 +701,7 @@ FG.Construction = class Construction {
       }
       break;
     }
-    if (p.cursor >= p.entries.length) return progressed;
+    if (p.cursor >= aTo) return progressed;
     // 落成冷却中：不提前抢料（避免占着建材不公平），等间隔到期下轮再分配
     if (p.timer > 0) return progressed;
 
@@ -405,10 +710,10 @@ FG.Construction = class Construction {
     if (this.pullEntry(head, pool, false)) progressed = true;
     let target = this.entryReady(head) ? head : null;
 
-    // 前沿凑不齐：向后找一栋「现在就能凑齐整套成本」的条目先建（不抢前沿已预留的料）
+    // 前沿凑不齐：活跃阶段内向后找一栋「现在就能凑齐整套成本」的条目先建（不抢前沿已预留的料）
     if (!target) {
       p.waiting = true;
-      for (let i = p.cursor + 1; i < p.entries.length; i++) {
+      for (let i = p.cursor + 1; i < aTo; i++) {
         const e = p.entries[i];
         if (e.state !== 'wait' || this.checkEntry(e) !== 'ok') continue;
         // 已成套（可能上一 tick 冷却期已预留）或本轮能成套取出，即作为先建目标；
@@ -592,12 +897,23 @@ FG.Construction = class Construction {
         id: p.id, name: p.name, kind: p.kind || 'build',
         priority: p.priority, paused: !!p.paused,
         deps: (p.deps || []).slice(),
+        stages: (p.stages || []).map(s => ({
+          cut: s.cut,
+          gate: s.gate ? {
+            mode: s.gate.mode,
+            item: s.gate.item || null,
+            n: s.gate.n || FG.Config.STAGE_TRIAL_COUNT,
+            opened: !!s.gate.opened,
+          } : null,
+        })),
+        activeStage: p.activeStage || 0,
         cursor: p.cursor, timer: p.timer, waiting: p.waiting,
         entries: p.entries.map(e => ({
           type: e.type, from: e.from || null, x: e.x, y: e.y, dir: e.dir, recipe: e.recipe,
           filter: e.filter, demandMode: e.demandMode, priority: e.priority, state: e.state,
           stationName: e.stationName || null,
           stock: Object.assign({}, e.stock),
+          base: (e.base === undefined || e.base === null) ? null : e.base,
         })),
       })),
     };
@@ -614,7 +930,9 @@ FG.Construction = class Construction {
         stationName: e.stationName || null,
         state: e.state || 'wait',
         stock: e.stock || {},
+        base: (typeof e.base === 'number') ? e.base : null,   // 旧档无 base → 未建立（懒快照）
       }));
+      const n = entries.length;
       const plan = {
         id: sp.id || ('P' + (this.seq - 1)),
         name: sp.name || '施工计划',
@@ -622,12 +940,22 @@ FG.Construction = class Construction {
         priority: VALID_PRIORITIES[sp.priority] ? sp.priority : 'normal',
         paused: !!sp.paused,
         deps: Array.isArray(sp.deps) ? sp.deps.slice() : [],
+        // 旧存档无 stages 字段 → 整体单阶段（无闸门），行为与旧版一致
+        stages: Array.isArray(sp.stages) && sp.stages.length
+          ? sp.stages.map(s => ({ cut: s.cut | 0, gate: s.gate ? sanitizeGate(s.gate) : null }))
+          : [{ cut: n, gate: null }],
+        activeStage: 0,
         cursor: sp.cursor || 0,
         timer: sp.timer || 0,
         waiting: !!sp.waiting,
         blocked: false,
+        stageBlocked: false,
+        stageReason: '',
         entries,
       };
+      // 切分点规整（末尾补全到 n，剔除越界/重复），闸门随阶段序号保留
+      this.normalizeStages(plan);
+      plan.activeStage = 0;
       // 旧存档兼容：旧版预留记在计划级 p.stock，迁移到前沿待建条目，续建语义不变
       if (sp.stock && typeof sp.stock === 'object') {
         const head = entries.find(e => e.state === 'wait');
@@ -645,6 +973,59 @@ FG.Construction = class Construction {
 
 const TIERS = ['high', 'normal', 'low'];
 const VALID_PRIORITIES = { high: 1, normal: 1, low: 1 };
+
+/** 闸门配置规整：built → {mode:'built'}；trial → {mode:'trial',item,n}；非法 → null */
+function sanitizeGate(g) {
+  if (!g || typeof g !== 'object') return null;
+  if (g.mode === 'trial') {
+    const n = Math.max(1, Math.min(999, parseInt(g.n, 10) || FG.Config.STAGE_TRIAL_COUNT));
+    return { mode: 'trial', item: g.item || null, n, opened: !!g.opened };
+  }
+  return { mode: 'built', opened: !!g.opened };
+}
+
+/** 试产所需完成次数（缺省回退默认值） */
+function trialNeed(gate) {
+  return Math.max(1, parseInt(gate && gate.n, 10) || FG.Config.STAGE_TRIAL_COUNT);
+}
+
+/**
+ * 条目落成建筑是否为「可试产生产建筑」：配方建筑（熔炉/组装机/化工厂/炼油厂）或矿机；
+ * 实验室与物流建筑不产出可计量产物。
+ */
+function isProducer(e, b) {
+  if (!b) return false;
+  if (b.def && b.def.recipeBuilding) return true;
+  return b.type === 'miner';
+}
+
+/** 生产建筑当前的产物 item 列表（配方结果；矿机取所在矿脉矿种） */
+function producerItems(game, e, b) {
+  if (b.type === 'miner') {
+    const o = (game && game.map && game.map.oreAt) ? game.map.oreAt(b.x, b.y) : null;
+    return [o || b.oreType].filter(Boolean);
+  }
+  if (b.recipe) {
+    const r = FG.Recipes.byId(b.recipe);
+    if (r) return r.results.filter(x => !FG.Items.isFluid(x.item)).map(x => x.item);
+  }
+  // 蓝图预设了配方但建筑落成后未挂上（异常/旧档兜底）
+  if (e.recipe) {
+    const r = FG.Recipes.byId(e.recipe);
+    if (r) return r.results.filter(x => !FG.Items.isFluid(x.item)).map(x => x.item);
+  }
+  return [];
+}
+
+/** 蓝图条目计划产出（未落建筑时推断）：预设配方的固体产物；矿机取资源约束的矿种 */
+function plannedItems(e) {
+  if (e.recipe) {
+    const r = FG.Recipes.byId(e.recipe);
+    if (r) return r.results.filter(x => !FG.Items.isFluid(x.item)).map(x => x.item);
+  }
+  if (e.type === 'miner' && e.require && e.require.oreType) return [e.require.oreType];
+  return [];
+}
 
 /**
  * 全局建材预算池：tick 初盘点全图自由建材（箱子→地面堆），

@@ -580,6 +580,11 @@ FG.Game = class Game {
   addPlanDep(planId, depId) { return this.construction.addDep(planId, depId); }
   removePlanDep(planId, depId) { return this.construction.removeDep(planId, depId); }
 
+  /** 分阶段施工：切分阶段 / 删除阶段边界 / 设置闸门（built 建成 / trial 试产达标） */
+  splitPlanStage(planId, cut) { return this.construction.splitStage(planId, cut); }
+  removePlanStage(planId, idx) { return this.construction.removeStage(planId, idx); }
+  setPlanStageGate(planId, idx, gate) { return this.construction.setStageGate(planId, idx, gate); }
+
   /** @deprecated 旧名兼容：提交施工计划（新代码请用 submitBlueprintPlanAt） */
   submitBlueprintPlan(ox, oy) { return this.submitBlueprintPlanAt(ox, oy); }
 
